@@ -217,7 +217,20 @@ public class FlexboxLayout extends ViewGroup {
      */
     private SparseIntArray mOrderCache;
 
+    private int mIndexAffectedFromLastMeasure = 0;
+
+    private int mFlexLinesCountNotAffected = 0;
+
+    /**
+     * The latest flex lines information.
+     */
     private List<FlexLine> mFlexLines = new ArrayList<>();
+
+    /**
+     * The previous flex lines information to determine from which flex line needs to be
+     * recalculated
+     */
+    private List<FlexLine> mFlexLinesCache = new ArrayList<>();
 
     public FlexboxLayout(Context context) {
         this(context, null);
@@ -247,16 +260,42 @@ public class FlexboxLayout extends ViewGroup {
         if (isOrderChangedFromLastMeasurement()) {
             mReorderedIndices = createReorderedIndices();
         }
-        // TODO: Only calculate the children views which are affected from the last measure.
+
+        int itemCountSum = 0;
+        mFlexLinesCountNotAffected = 0;
+        if (mIndexAffectedFromLastMeasure > 0) {
+            // The last flex item needs to be calculated anyway regardless of the diff from the
+            // last measurement, thus skip the last flex line
+            for (int i = 0; i < mFlexLines.size() - 1; i++) {
+                FlexLine flexLine = mFlexLines.get(i);
+                if (itemCountSum + flexLine.itemCount < mIndexAffectedFromLastMeasure + 1) {
+                    mFlexLinesCountNotAffected++;
+                    itemCountSum += flexLine.itemCount;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // The first n flex lines don't need to be recalculated where n < mFlexLinesCountNotAffected
+        // Preserve the n flex line and remove the rest of the flex lines.
+        if (mFlexLinesCountNotAffected > 0) {
+            int flexLinesCountBefore = mFlexLines.size();
+            for (int i = 0; i < flexLinesCountBefore - mFlexLinesCountNotAffected; i++) {
+                mFlexLines.remove(mFlexLinesCountNotAffected);
+            }
+        } else {
+            mFlexLines.clear();
+        }
 
         switch (mFlexDirection) {
             case FLEX_DIRECTION_ROW: // Intentional fall through
             case FLEX_DIRECTION_ROW_REVERSE:
-                measureHorizontal(widthMeasureSpec, heightMeasureSpec);
+                measureHorizontal(widthMeasureSpec, heightMeasureSpec, itemCountSum);
                 break;
             case FLEX_DIRECTION_COLUMN: // Intentional fall through
             case FLEX_DIRECTION_COLUMN_REVERSE:
-                measureVertical(widthMeasureSpec, heightMeasureSpec);
+                measureVertical(widthMeasureSpec, heightMeasureSpec, itemCountSum);
                 break;
             default:
                 throw new IllegalStateException(
@@ -287,6 +326,9 @@ public class FlexboxLayout extends ViewGroup {
         // FlexboxLayout's onMeasure is called.
         // Because requestLayout is requested in the super.addView method.
         mReorderedIndices = createReorderedIndices(child, index, params);
+        int affectedIndex = index == -1 ? mReorderedIndices.length - 1 : index;
+        mIndexAffectedFromLastMeasure = mReorderedIndices[affectedIndex];
+        mFlexLinesCache = new ArrayList<>(mFlexLines);
         super.addView(child, index, params);
     }
 
@@ -404,18 +446,17 @@ public class FlexboxLayout extends ViewGroup {
      *
      * @param widthMeasureSpec  horizontal space requirements as imposed by the parent
      * @param heightMeasureSpec vertical space requirements as imposed by the parent
+     * @param startIndex the first index that needs to be measured from
      * @see #onMeasure(int, int)
      * @see #setFlexDirection(int)
      * @see #setFlexWrap(int)
      * @see #setAlignItems(int)
      * @see #setAlignContent(int)
      */
-    private void measureHorizontal(int widthMeasureSpec, int heightMeasureSpec) {
+    private void measureHorizontal(int widthMeasureSpec, int heightMeasureSpec, int startIndex) {
         int widthMode = MeasureSpec.getMode(widthMeasureSpec);
         int widthSize = MeasureSpec.getSize(widthMeasureSpec);
         int childState = 0;
-
-        mFlexLines.clear();
 
         // Determine how many flex lines are needed in this layout by measuring each child.
         // (Expand or shrink the view depending on the flexGrow and flexShrink attributes in a later
@@ -427,7 +468,7 @@ public class FlexboxLayout extends ViewGroup {
             int largestHeightInRow = Integer.MIN_VALUE;
             FlexLine flexLine = new FlexLine();
             flexLine.mainSize = paddingStart;
-            for (int i = 0; i < childCount; i++) {
+            for (int i = startIndex; i < childCount; i++) {
                 View child = getReorderedChildAt(i);
                 if (child == null) {
                     continue;
@@ -505,16 +546,18 @@ public class FlexboxLayout extends ViewGroup {
             }
         }
 
-        determineMainSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec);
+        determineMainSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec, startIndex,
+                mFlexLinesCountNotAffected);
 
         // TODO: Consider the case any individual child's alignSelf is set to ALIGN_SELF_BASELINE
         if (mAlignItems == ALIGN_ITEMS_BASELINE) {
-            int viewIndex = 0;
-            for (FlexLine flexLine : mFlexLines) {
+            int viewIndex = startIndex;
+            for (int i = mFlexLinesCountNotAffected; i < mFlexLines.size(); i++) {
+                FlexLine flexLine = mFlexLines.get(i);
                 // The largest height value that also take the baseline shift into account
                 int largestHeightInLine = Integer.MIN_VALUE;
-                for (int i = viewIndex; i < viewIndex + flexLine.itemCount; i++) {
-                    View child = getReorderedChildAt(i);
+                for (int j = viewIndex; j < viewIndex + flexLine.itemCount; j++) {
+                    View child = getReorderedChildAt(j);
                     LayoutParams lp = (LayoutParams) child.getLayoutParams();
                     if (mFlexWrap != FLEX_WRAP_WRAP_REVERSE) {
                         int marginTop = flexLine.maxBaseline - child.getBaseline();
@@ -535,9 +578,30 @@ public class FlexboxLayout extends ViewGroup {
         }
 
         determineCrossSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec);
+
+        // After the cross size is determined, compare the current flex lines and the cached
+        // flex lines starting from 0 (first flex line) to the previous of the last flex line
+        // (the last flex line needs to be recalculated anyway) to know from which flex line
+        // needs to be recalculated
+        //
+        // Even if mIndexAffectedFromLastMeasure and mFlexLinesCountNotAffected are set to non
+        // zero values cross size for the flex lines may change from the last measurement.
+        // E.g. The number of flex lines is increased from the last measurement, thus the amount
+        // of free space is changed.
+        mFlexLinesCountNotAffected = 0;
+        startIndex = 0;
+        for (int i = 0; i < mFlexLines.size() - 1; i++) {
+            FlexLine previous = mFlexLinesCache.size() > i ? mFlexLinesCache.get(i) : null;
+            FlexLine current = mFlexLines.get(i);
+            if (current.equals(previous)) {
+                mFlexLinesCountNotAffected++;
+                startIndex += current.itemCount;
+            }
+        }
+
         // Now cross size for each flex line is determined.
         // Expand the views if alignItems (or alignSelf in each child view) is set to stretch
-        stretchViews(mFlexDirection, mAlignItems);
+        stretchViews(mFlexDirection, mAlignItems, startIndex, mFlexLinesCountNotAffected);
         setMeasuredDimensionForFlex(mFlexDirection, widthMeasureSpec, heightMeasureSpec,
                 childState);
     }
@@ -547,19 +611,18 @@ public class FlexboxLayout extends ViewGroup {
      * (either from top to bottom or bottom to top).
      *
      * @param widthMeasureSpec  horizontal space requirements as imposed by the parent
-     * @param heightMeasureSpec vertical space requirements as imposed by the parent
+     * @param widthMeasureSpec  horizontal space requirements as imposed by the parent
+     * @param startIndex the first index that needs to be measured from
      * @see #onMeasure(int, int)
      * @see #setFlexDirection(int)
      * @see #setFlexWrap(int)
      * @see #setAlignItems(int)
      * @see #setAlignContent(int)
      */
-    private void measureVertical(int widthMeasureSpec, int heightMeasureSpec) {
+    private void measureVertical(int widthMeasureSpec, int heightMeasureSpec, int startIndex) {
         int heightMode = MeasureSpec.getMode(heightMeasureSpec);
         int heightSize = MeasureSpec.getSize(heightMeasureSpec);
         int childState = 0;
-
-        mFlexLines.clear();
 
         // Determine how many flex lines are needed in this layout by measuring each child.
         // (Expand or shrink the view depending on the flexGrow and flexShrink attributes in a later
@@ -635,11 +698,33 @@ public class FlexboxLayout extends ViewGroup {
             }
         }
 
-        determineMainSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec);
+        determineMainSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec, startIndex,
+                mFlexLinesCountNotAffected);
         determineCrossSize(mFlexDirection, widthMeasureSpec, heightMeasureSpec);
+
+        // After the cross size is determined, compare the current flex lines and the cached
+        // flex lines starting from 0 (first flex line) to the previous of the last flex line
+        // (the last flex line needs to be recalculated anyway) to know from which flex line
+        // needs to be recalculated
+        //
+        // Even if mIndexAffectedFromLastMeasure and mFlexLinesCountNotAffected are set to non
+        // zero values cross size for the flex lines may change from the last measurement.
+        // E.g. The number of flex lines is increased from the last measurement, thus the amount
+        // of free space is changed.
+        mFlexLinesCountNotAffected = 0;
+        startIndex = 0;
+        for (int i = 0; i < mFlexLinesCache.size() - 1; i++) {
+            FlexLine previous = mFlexLinesCache.get(i);
+            FlexLine current = mFlexLines.size() > i ? mFlexLines.get(i) : null;
+            if (previous.equals(current)) {
+                mFlexLinesCountNotAffected++;
+                startIndex += current.itemCount;
+            }
+        }
+
         // Now cross size for each flex line is determined.
         // Expand the views if alignItems (or alignSelf in each child view) is set to stretch
-        stretchViews(mFlexDirection, mAlignItems);
+        stretchViews(mFlexDirection, mAlignItems, startIndex, mFlexLinesCountNotAffected);
         setMeasuredDimensionForFlex(mFlexDirection, widthMeasureSpec, heightMeasureSpec,
                 childState);
     }
@@ -656,7 +741,7 @@ public class FlexboxLayout extends ViewGroup {
      * @see #getFlexDirection()
      */
     private void determineMainSize(@FlexDirection int flexDirection, int widthMeasureSpec,
-            int heightMeasureSpec) {
+            int heightMeasureSpec, int startIndex, int startFlexLine) {
         int mainSize;
         int paddingAlongMainAxis;
         switch (flexDirection) {
@@ -686,14 +771,14 @@ public class FlexboxLayout extends ViewGroup {
                 throw new IllegalArgumentException("Invalid flex direction: " + flexDirection);
         }
 
-        int childIndex = 0;
-        for (FlexLine flexLine : mFlexLines) {
+        for (int i = startFlexLine; i < mFlexLines.size(); i++) {
+            FlexLine flexLine = mFlexLines.get(i);
             if (flexLine.mainSize < mainSize) {
-                childIndex = expandFlexItems(flexLine, flexDirection, mainSize,
-                        paddingAlongMainAxis, childIndex);
+                startIndex = expandFlexItems(flexLine, flexDirection, mainSize,
+                        paddingAlongMainAxis, startIndex);
             } else {
-                childIndex = shrinkFlexItems(flexLine, flexDirection, mainSize,
-                        paddingAlongMainAxis, childIndex);
+                startIndex = shrinkFlexItems(flexLine, flexDirection, mainSize,
+                        paddingAlongMainAxis, startIndex);
             }
         }
     }
@@ -916,6 +1001,31 @@ public class FlexboxLayout extends ViewGroup {
             default:
                 throw new IllegalArgumentException("Invalid flex direction: " + flexDirection);
         }
+
+        if ((mFlexLines.size() == 1 || mFlexLinesCache.size() == 1)
+                && mFlexLines.size() != mFlexLinesCache.size()) {
+            for (FlexLine flexLine : mFlexLines) {
+                int viewIndex = 0;
+                int largestCrossSize = Integer.MIN_VALUE;
+                for (int i = 0; i < flexLine.itemCount; i++, viewIndex++) {
+                    View view = getReorderedChildAt(viewIndex);
+                    if (view == null || view.getVisibility() == View.GONE) {
+                        continue;
+                    }
+                    LayoutParams lp = (LayoutParams) view.getLayoutParams();
+                    int crossSize;
+                    if (flexDirection == FLEX_DIRECTION_ROW
+                            || flexDirection == FLEX_DIRECTION_ROW_REVERSE) {
+                        crossSize = view.getMeasuredHeight() + lp.topMargin + lp.bottomMargin;
+                    } else {
+                        crossSize = view.getMeasuredWidth() + lp.leftMargin + lp.rightMargin;
+                    }
+                    largestCrossSize = Math.max(largestCrossSize, crossSize);
+                }
+                flexLine.crossSize = largestCrossSize;
+            }
+        }
+
         if (mode == MeasureSpec.EXACTLY) {
             int totalCrossSize = getSumOfCrossSize();
             if (mFlexLines.size() == 1) {
@@ -1044,11 +1154,12 @@ public class FlexboxLayout extends ViewGroup {
      * @see #setAlignItems(int)
      * @see LayoutParams#alignSelf
      */
-    private void stretchViews(int flexDirection, int alignItems) {
+    private void stretchViews(int flexDirection, int alignItems, int startIndex, int startFlexLine) {
         if (alignItems == ALIGN_ITEMS_STRETCH) {
-            int viewIndex = 0;
-            for (FlexLine flexLine : mFlexLines) {
-                for (int i = 0; i < flexLine.itemCount; i++, viewIndex++) {
+            int viewIndex = startIndex;
+            for (int i = startFlexLine; i < mFlexLines.size(); i++) {
+                FlexLine flexLine = mFlexLines.get(i);
+                for (int j = viewIndex; j < flexLine.itemCount; j++, viewIndex++) {
                     View view = getReorderedChildAt(viewIndex);
                     LayoutParams lp = (LayoutParams) view.getLayoutParams();
                     if (lp.alignSelf != LayoutParams.ALIGN_SELF_AUTO &&
@@ -1071,7 +1182,8 @@ public class FlexboxLayout extends ViewGroup {
                 }
             }
         } else {
-            for (FlexLine flexLine : mFlexLines) {
+            for (int i = startFlexLine; i < mFlexLines.size(); i++) {
+                FlexLine flexLine = mFlexLines.get(i);
                 for (Integer index : flexLine.indicesAlignSelfStretch) {
                     View view = getReorderedChildAt(index);
                     switch (flexDirection) {
@@ -1264,6 +1376,24 @@ public class FlexboxLayout extends ViewGroup {
         return sum;
     }
 
+    /**
+     * Retrieve the number of flex items included in the first n flex lines.
+     *
+     * @param n the number of flex lines where you want to retrieve the count of flex items
+     * @return the number of flex items in the first n flex lines
+     */
+    private int getItemCountForFirstNFlexLines(int n) {
+        int count = 0;
+        for (int i = 0; i < n; i++) {
+            if (mFlexLines.size() > i) {
+                count += mFlexLines.get(i).itemCount;
+            } else {
+                break;
+            }
+        }
+        return count;
+    }
+
     @Override
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         int layoutDirection = ViewCompat.getLayoutDirection(this);
@@ -1294,6 +1424,9 @@ public class FlexboxLayout extends ViewGroup {
             default:
                 throw new IllegalStateException("Invalid flex direction is set: " + mFlexDirection);
         }
+
+        mFlexLinesCountNotAffected = 0;
+        mIndexAffectedFromLastMeasure = 0;
     }
 
     /**
@@ -1321,7 +1454,7 @@ public class FlexboxLayout extends ViewGroup {
         // Use float to reduce the round error that may happen in when justifyContent ==
         // SPACE_BETWEEN or SPACE_AROUND
         float childLeft;
-        int currentViewIndex = 0;
+        int currentViewIndex = getItemCountForFirstNFlexLines(mFlexLinesCountNotAffected);
 
         int height = bottom - top;
         int width = right - left;
@@ -1330,11 +1463,18 @@ public class FlexboxLayout extends ViewGroup {
         int childBottom = height - getPaddingBottom();
         int childTop = getPaddingTop();
 
+        // If there are some flex lines that haven't changed, shift the starting vertical positions
+        for (int i = 0; i < mFlexLinesCountNotAffected; i++) {
+            childBottom -= mFlexLines.get(i).crossSize;
+            childTop += mFlexLines.get(i).crossSize;
+        }
+
         // Used only for RTL layout
         // Use float to reduce the round error that may happen in when justifyContent ==
         // SPACE_BETWEEN or SPACE_AROUND
         float childRight;
-        for (FlexLine flexLine : mFlexLines) {
+        for (int i = mFlexLinesCountNotAffected; i < mFlexLines.size(); i++) {
+            FlexLine flexLine = mFlexLines.get(i);
             float spaceBetweenItem = 0f;
             switch (mJustifyContent) {
                 case JUSTIFY_CONTENT_FLEX_START:
@@ -1368,7 +1508,7 @@ public class FlexboxLayout extends ViewGroup {
             }
             spaceBetweenItem = Math.max(spaceBetweenItem, 0);
 
-            for (int i = 0; i < flexLine.itemCount; i++) {
+            for (int j = 0; j < flexLine.itemCount; j++) {
                 View child = getReorderedChildAt(currentViewIndex);
                 if (child == null) {
                     continue;
@@ -1520,7 +1660,7 @@ public class FlexboxLayout extends ViewGroup {
 
         int paddingRight = getPaddingRight();
         int childLeft = getPaddingLeft();
-        int currentViewIndex = 0;
+        int currentViewIndex = getItemCountForFirstNFlexLines(mFlexLinesCountNotAffected);
 
         int width = right - left;
         int height = bottom - top;
@@ -1528,13 +1668,20 @@ public class FlexboxLayout extends ViewGroup {
         // childLeft is used to align the horizontal position of the children views.
         int childRight = width - paddingRight;
 
+        // If there are some flex lines that haven't changed, shift the starting vertical positions
+        for (int i = 0; i < mFlexLinesCountNotAffected; i++) {
+            childRight -= mFlexLines.get(i).crossSize;
+            childLeft += mFlexLines.get(i).crossSize;
+        }
+
         // Use float to reduce the round error that may happen in when justifyContent ==
         // SPACE_BETWEEN or SPACE_AROUND
         float childTop;
 
         // Used only for if the direction is from bottom to top
         float childBottom;
-        for (FlexLine flexLine : mFlexLines) {
+        for (int i = mFlexLinesCountNotAffected; i < mFlexLines.size(); i++) {
+            FlexLine flexLine = mFlexLines.get(i);
             float spaceBetweenItem = 0f;
             switch (mJustifyContent) {
                 case JUSTIFY_CONTENT_FLEX_START:
@@ -1569,7 +1716,7 @@ public class FlexboxLayout extends ViewGroup {
             }
             spaceBetweenItem = Math.max(spaceBetweenItem, 0);
 
-            for (int i = 0; i < flexLine.itemCount; i++) {
+            for (int j = 0; j < flexLine.itemCount; j++) {
                 View child = getReorderedChildAt(currentViewIndex);
                 if (child == null) {
                     continue;
@@ -1917,5 +2064,56 @@ public class FlexboxLayout extends ViewGroup {
          * not the relative indices in this flex line.
          */
         List<Integer> indicesAlignSelfStretch = new ArrayList<>();
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+
+            FlexLine flexLine = (FlexLine) o;
+
+            if (mainSize != flexLine.mainSize) {
+                return false;
+            }
+            if (crossSize != flexLine.crossSize) {
+                return false;
+            }
+            if (itemCount != flexLine.itemCount) {
+                return false;
+            }
+            if (Float.compare(flexLine.totalFlexGrow, totalFlexGrow) != 0) {
+                return false;
+            }
+            if (Float.compare(flexLine.totalFlexShrink, totalFlexShrink) != 0) {
+                return false;
+            }
+            if (maxBaseline != flexLine.maxBaseline) {
+                return false;
+            }
+            return indicesAlignSelfStretch != null ? indicesAlignSelfStretch
+                    .equals(flexLine.indicesAlignSelfStretch)
+                    : flexLine.indicesAlignSelfStretch == null;
+
+        }
+
+        @Override
+        public int hashCode() {
+            int result = mainSize;
+            result = 31 * result + crossSize;
+            result = 31 * result + itemCount;
+            result = 31 * result + (totalFlexGrow != +0.0f ? Float.floatToIntBits(totalFlexGrow)
+                    : 0);
+            result = 31 * result + (totalFlexShrink != +0.0f ? Float.floatToIntBits(totalFlexShrink)
+                    : 0);
+            result = 31 * result + maxBaseline;
+            result = 31 * result + (indicesAlignSelfStretch != null ? indicesAlignSelfStretch
+                    .hashCode()
+                    : 0);
+            return result;
+        }
     }
 }
