@@ -19,15 +19,22 @@ package com.google.android.flexbox;
 import android.content.Context;
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.support.annotation.IntDef;
 import android.support.v7.widget.LinearLayoutManager;
+import android.support.v7.widget.OrientationHelper;
 import android.support.v7.widget.RecyclerView;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
 import java.util.List;
+
+import static android.support.v7.widget.LinearLayoutManager.INVALID_OFFSET;
+import static android.support.v7.widget.RecyclerView.NO_POSITION;
 
 /**
  * LayoutManager for the {@link RecyclerView}. This class is intended to be used within a
@@ -88,6 +95,20 @@ public class FlexboxLayoutManager extends RecyclerView.LayoutManager implements 
      * (such as the one in {@link #onLayoutChildren(RecyclerView.Recycler, RecyclerView.State)})
      */
     private RecyclerView.State mState;
+
+    private LayoutState mLayoutState;
+
+    private AnchorInfo mAnchorInfo = new AnchorInfo();
+
+    /**
+     * {@link OrientationHelper} along the main axis.
+     */
+    private OrientationHelper mMainOrientationHelper;
+
+    /**
+     * {@link OrientationHelper} along the cross axis.
+     */
+    private OrientationHelper mCrossOrientationHelper;
 
     /**
      * Creates a default FlexboxLayoutManager.
@@ -386,6 +407,12 @@ public class FlexboxLayoutManager extends RecyclerView.LayoutManager implements 
         if (childCount == 0 && state.isPreLayout()) {
             return;
         }
+        ensureOrientationHelper();
+        AnchorInfo anchorInfo = mAnchorInfo;
+        anchorInfo.reset();
+        anchorInfo.assignCoordinateFromPadding();
+        anchorInfo.mPosition = 0;
+        // TODO: Update the anchorInfo if any pendingState is stored
 
         // TODO: If we support the order attribute, we need to inflate the all ViewHolders in the
         // adapter instead of inflating only the visible ViewHolders, which is inefficient given
@@ -418,8 +445,12 @@ public class FlexboxLayoutManager extends RecyclerView.LayoutManager implements 
                         flexLine.getItemCount()));
             }
         }
+        detachAndScrapAttachedViews(recycler);
+        updateLayoutState(anchorInfo);
 
-        // TODO: Layout the visible ViewHolders
+        // TODO: Consider RTL
+        mLayoutState.mLayoutDirection = LayoutDirection.END;
+        fill(recycler, mLayoutState, state);
     }
 
     @Override
@@ -427,8 +458,81 @@ public class FlexboxLayoutManager extends RecyclerView.LayoutManager implements 
         removeAllViews();
     }
 
+    private int fill(RecyclerView.Recycler recycler, LayoutState layoutState,
+            RecyclerView.State state) {
+        int start = layoutState.mAvailable;
+        int remainingSpace = layoutState.mAvailable;
+        while (remainingSpace > 0 && layoutState.hasMore(state)) {
+            FlexLine flexLine = mFlexLines.get(layoutState.mCurrentFlexLinePosition);
+            layoutFlexLine(recycler, flexLine, layoutState);
+            layoutState.mOffset += flexLine.getCrossSize();
+            remainingSpace -= flexLine.getCrossSize();
+            layoutState.mAvailable -= flexLine.getCrossSize();
+        }
+        return start - layoutState.mAvailable;
+    }
+
+    private void layoutFlexLine(RecyclerView.Recycler recycler, FlexLine flexLine,
+            LayoutState layoutState) {
+        if (isMainAxisDirectionHorizontal()) {
+            layoutFlexLineMainAxisHorizontal(recycler, flexLine, layoutState);
+        } else {
+            layoutFlexLineMainAxisVertical(recycler, flexLine, layoutState);
+        }
+    }
+
+    private void layoutFlexLineMainAxisHorizontal(RecyclerView.Recycler recycler, FlexLine flexLine,
+            LayoutState layoutState) {
+        int childTop = layoutState.mOffset;
+        int childLeft = getPaddingLeft();
+        int startPosition = layoutState.mCurrentPosition;
+        for (int i = startPosition, itemCount = flexLine.getItemCount();
+                i < startPosition + itemCount; i++) {
+            View view = layoutState.next(recycler);
+            layoutState.mCurrentPosition++;
+            if (view == null) {
+                continue;
+            }
+            measureChildWithMargins(view, 0, 0);
+            addView(view);
+            layoutDecoratedWithMargins(view, childLeft, childTop,
+                    childLeft + view.getMeasuredWidth(), childTop + view.getMeasuredHeight());
+            childTop += view.getMeasuredHeight();
+            childLeft += view.getMeasuredWidth();
+        }
+        layoutState.mCurrentFlexLinePosition++;
+    }
+
+    private void layoutFlexLineMainAxisVertical(RecyclerView.Recycler recycler, FlexLine flexLine,
+            LayoutState layoutState) {
+        // TODO: Implement the method
+    }
+
     private boolean isMainAxisDirectionHorizontal() {
         return mFlexDirection == FlexDirection.ROW || mFlexDirection == FlexDirection.ROW_REVERSE;
+    }
+
+    private void updateLayoutState(AnchorInfo anchorInfo) {
+        mLayoutState.mAvailable = mCrossOrientationHelper.getEndAfterPadding() - anchorInfo.mOffset;
+        mLayoutState.mCurrentPosition = anchorInfo.mPosition;
+        mLayoutState.mItemDirection = ItemDirection.TAIL;
+        mLayoutState.mLayoutDirection = LayoutDirection.END;
+        mLayoutState.mOffset = anchorInfo.mOffset;
+        mLayoutState.mScrollingOffset = LayoutState.SCOLLING_OFFSET_NaN;
+        mLayoutState.mCurrentFlexLinePosition = 0;
+    }
+
+    private void ensureOrientationHelper() {
+        if (mMainOrientationHelper == null) {
+            if (isMainAxisDirectionHorizontal()) {
+                mMainOrientationHelper = OrientationHelper.createHorizontalHelper(this);
+                mCrossOrientationHelper = OrientationHelper.createVerticalHelper(this);
+            } else {
+                mMainOrientationHelper = OrientationHelper.createVerticalHelper(this);
+                mCrossOrientationHelper = OrientationHelper.createHorizontalHelper(this);
+            }
+            mLayoutState = new LayoutState();
+        }
     }
 
     /**
@@ -724,5 +828,101 @@ public class FlexboxLayoutManager extends RecyclerView.LayoutManager implements 
                 return new LayoutParams[size];
             }
         };
+    }
+
+    /**
+     * A class that holds the information about an anchor position like from what pixels layout
+     * should start.
+     */
+    private class AnchorInfo {
+
+        private int mPosition;
+
+        private int mOffset;
+
+        private boolean mLayoutFromEnd;
+
+        private void reset() {
+            mPosition = NO_POSITION;
+            mOffset = INVALID_OFFSET;
+            mLayoutFromEnd = false;
+        }
+
+        private void assignCoordinateFromPadding() {
+            mOffset = mLayoutFromEnd ? mCrossOrientationHelper.getEndAfterPadding()
+                    : mCrossOrientationHelper.getStartAfterPadding();
+        }
+    }
+
+    /** Defines the direction in which the layout is filled. */
+    @IntDef({LayoutDirection.START, LayoutDirection.END})
+    @Retention(RetentionPolicy.SOURCE)
+    private @interface LayoutDirection {
+
+        int START = -1;
+        int END = 1;
+    }
+
+    /** Defines the direction in which the data adapter is traversed. */
+    @IntDef({ItemDirection.HEAD, ItemDirection.TAIL})
+    @Retention(RetentionPolicy.SOURCE)
+    private @interface ItemDirection {
+
+        int HEAD = -1;
+        int TAIL = 1;
+    }
+
+    /**
+     * Helper class that keeps temporary state while {LayoutManager} is filling out the empty
+     * space.
+     */
+    private class LayoutState {
+
+        private final static int SCOLLING_OFFSET_NaN = Integer.MIN_VALUE;
+
+        /** Number of pixels that we should fill, in the layout direction. */
+        private int mAvailable;
+
+        /** Current position on the flex lines being in the layout call */
+        private int mCurrentFlexLinePosition;
+
+        /** Current position on the adapter to get the next item. */
+        private int mCurrentPosition;
+
+        /** Pixel offset where layout should start */
+        int mOffset;
+
+        /**
+         * Used when LayoutState is constructed in a scrolling state.
+         * It should be set the amount of scrolling we can make without creating a new view.
+         * Settings this is required for efficient view recycling.
+         */
+        int mScrollingOffset;
+
+        @ItemDirection
+        private int mItemDirection = ItemDirection.TAIL;
+
+        @LayoutDirection
+        private int mLayoutDirection = LayoutDirection.END;
+
+        /**
+         * @return true if there are more items to layout
+         */
+        private boolean hasMore(RecyclerView.State state) {
+            return mCurrentPosition >= 0 && mCurrentPosition < state.getItemCount() &&
+                    mCurrentFlexLinePosition < mFlexLines.size();
+        }
+
+        /**
+         * Gets the view for the next element that we should render.
+         * Also updates current item index to the next item, based on {@link #mItemDirection}
+         *
+         * @return The next element that we should render.
+         */
+        private View next(RecyclerView.Recycler recycler) {
+            final View view = recycler.getViewForPosition(mCurrentPosition);
+            mCurrentPosition += mItemDirection;
+            return view;
+        }
     }
 }
